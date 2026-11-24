@@ -1,0 +1,14 @@
+schema_version = "1.0.0"
+id = "jigglekit_demo"
+version = "1.0.0"
+name = "JiggleKit Free - 8-Bone Jiggle Physics"
+tagline = "Free version: 8 simulated bones, all features"
+maintainer = "Mendbox Studio"
+type = "add-on"
+tags = ["Animation", "Rigging", "Physics"]
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+# no `platforms` key: pure Python + numpy, valid on every platform (Blendkit rejects a list with linux-arm64)
+
+[build]
+paths_exclude_pattern = ["__pycache__/", "*.pyc", ".*"]
