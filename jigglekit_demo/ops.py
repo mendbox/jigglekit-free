@@ -287,6 +287,8 @@ class JIGGLEKIT_OT_bake(bpy.types.Operator):
             _result(context, "bake", ok=False, error=err)
             self.report({'ERROR'}, err)
             return {'CANCELLED'}
+        end, asked = bake.free_range(start, end)       # Free edition: the first 250 frames of a longer range
+        limited = asked > end - start + 1
         frame0 = sc.frame_current
         wm = context.window_manager
         total = end - start + 1 + jk.bake_warmup
@@ -321,10 +323,16 @@ class JIGGLEKIT_OT_bake(bpy.types.Operator):
         if jk.bake_target == 'ACTION':
             msgs.append("The old rotation keys of these bones were replaced. Undo restores them. Clear Bake "
                         "removes the baked keys.")
+        details = dict(action=info['action'], start=start, end=end)
+        if limited:                                   # a limit of the Free edition, not an error: the bake is valid
+            msgs.append(bake.free_bake_note(asked))
+            details['free_limit'] = dict(asked=asked, baked=end - start + 1)
         _result(context, "bake", messages=msgs,
                 counts=dict(frames=len(frames), bones=len(names), curves=info['curves'], keys=info['keys']),
-                timings=dict(simulate=round(t_sim, 3), total=round(t_all, 3)), details=dict(action=info['action']))
+                timings=dict(simulate=round(t_sim, 3), total=round(t_all, 3)), details=details)
         self.report({'INFO'}, msg)
+        if limited:
+            self.report({'INFO'}, msgs[-1])
         return {'FINISHED'}
 
 

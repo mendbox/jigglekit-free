@@ -30,6 +30,8 @@ RESULT = _KEY + "_result"
 CLASS_PREFIX = _KEY.upper()
 EDITION = "DEMO" if ADDON_ID.endswith("_demo") else "FULL"
 DEMO_BONE_LIMIT = 8
+DEMO_BAKE_FRAMES = 250       # Free edition: Bake to Keyframes writes at most this many frames of the range
+FULL_URL = "https://mendbox.gumroad.com/l/jigglekit"
 
 # Physics (spec 5.2)
 K_BASE = 1600.0              # k_i = K_BASE * stiffness_i (1/s^2); stiffness 1 -> omega 40 rad/s

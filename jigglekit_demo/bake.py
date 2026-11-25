@@ -15,6 +15,7 @@ import bpy
 import numpy as np
 
 from . import ids, model, runtime
+from .const import DEMO_BAKE_FRAMES, EDITION, FULL_URL
 
 TRACK = "JiggleKit Bake"
 TAG = "jigglekit_bake"             # custom property on the bake action: the bake_id
@@ -35,6 +36,26 @@ def frame_range(scene, jk):
     if jk.bake_use_scene_range:
         return scene.frame_start, scene.frame_end
     return jk.bake_start, jk.bake_end
+
+
+# Free edition: a bake covers at most DEMO_BAKE_FRAMES frames, the first ones of the range. The limit is applied
+# here (free_range, record, _curves), not in the panel, so a script that calls the operator or these functions
+# gets the same result. The live simulation is never limited.
+FREE_BAKE_NOTE = ("Free version: bake up to %d frames (you asked for %d), so the first %d were baked. "
+                  "Full version: unlimited, " + FULL_URL)
+
+
+def free_range(start, end):
+    """(last frame that is baked, number of frames asked for). Full edition: the range as it is. Free edition:
+    the first DEMO_BAKE_FRAMES frames of a longer range."""
+    asked = end - start + 1
+    if EDITION == 'DEMO' and asked > DEMO_BAKE_FRAMES:
+        return start + DEMO_BAKE_FRAMES - 1, asked
+    return end, asked
+
+
+def free_bake_note(asked):
+    return FREE_BAKE_NOTE % (DEMO_BAKE_FRAMES, asked, DEMO_BAKE_FRAMES)
 
 
 def key_frames(start, end, step):
@@ -90,7 +111,9 @@ def chain_bone_names(ob):
 def record(scene, ob, start, end, warmup, progress=None, fail_at=None):
     """Run the simulation over start - warmup .. end through the frame handler. Returns (names, Q) with
     Q (end - start + 1, N, 4) float64 (sign-continuous, spec 5.2). The caller restores the frame. Not for an
-    armature with an active bake (the baked keys would be simulated twice)."""
+    armature with an active bake (the baked keys would be simulated twice). Free edition: end is cut by
+    free_range(), so Q has at most DEMO_BAKE_FRAMES frames."""
+    end, _asked = free_range(start, end)
     if ob.jigglekit.use_baked:
         raise BakeError("Bake already exists. Clear it first.")
     runtime.RT.pop(runtime.key(ob), None)
@@ -181,6 +204,9 @@ def _fill(fc, x, y):
 def _curves(names, frames, Q, reduce_tol=None):
     """(bone name, index, x, y) for every F-curve to write; keys reduced when reduce_tol is set."""
     x_all = np.asarray(frames, dtype=np.float64)
+    if EDITION == 'DEMO' and len(x_all) and x_all[-1] - x_all[0] >= DEMO_BAKE_FRAMES:   # never reached through
+        keep = x_all - x_all[0] < DEMO_BAKE_FRAMES                                     # record(); see free_range
+        x_all, Q = x_all[keep], np.asarray(Q)[keep]
     for b, name in enumerate(names):
         for i in range(4):
             y = Q[:, b, i]

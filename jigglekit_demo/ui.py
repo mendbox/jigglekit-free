@@ -10,8 +10,8 @@ import textwrap
 
 import bpy
 
-from . import model, presets, runtime
-from .const import DEMO_BONE_LIMIT, EDITION, RESULT, TAB
+from . import bake, model, presets, runtime
+from .const import DEMO_BAKE_FRAMES, DEMO_BONE_LIMIT, EDITION, RESULT, TAB
 from .create_ops import active_chain
 from .ops import context_armature
 
@@ -259,6 +259,16 @@ class JIGGLEKIT_PT_bake(_Sub, bpy.types.Panel):
         sub = col.column()
         sub.enabled = jk.bake_reduce
         sub.prop(jk, "bake_tolerance")
+        if EDITION == 'DEMO':          # the Free edition's bake limit, said before the button is pressed
+            start, end = bake.frame_range(context.scene, jk)
+            _end, asked = bake.free_range(start, end)
+            box = layout.box()
+            if asked > DEMO_BAKE_FRAMES and not jk.bake_id:
+                wrapped(box, context, "Free version: bake up to %d frames. This range has %d: the first %d will "
+                        "be baked." % (DEMO_BAKE_FRAMES, asked, DEMO_BAKE_FRAMES), icon='INFO', indent=3)
+            else:
+                box.label(text="Free version: bake up to %d frames" % DEMO_BAKE_FRAMES, icon='INFO')
+            box.operator("wm.url_open", text="Full version: unlimited").url = STORE_URL
         # one button per row: side by side "Bake to Keyframes" was cut ("Bake to Keyfra...") at the default width
         col = layout.column(align=True)
         col.scale_y = 1.3
@@ -332,6 +342,8 @@ class JIGGLEKIT_PT_result(_Sub, bpy.types.Panel):
         for m in msgs[:8]:
             alert = res.get('ok') is False or m.startswith(("Bone", "Chain", "Collider", "Orphan", "Simulation",
                                                              "Non-uniform", "Frame rate", "Free version"))
+            if m.startswith("Free version: bake"):       # the bake limit is information, not a problem: not red
+                alert = False
             wrapped(box, context, m, icon='DOT', alert=alert, indent=6)
         if res.get('op') == "add_chains_from_bones" and res.get('euler'):
             # one click instead of a trip to the N panel for every FK control of a Rigify / CloudRig rig
