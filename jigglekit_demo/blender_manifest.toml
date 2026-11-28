@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "jigglekit_demo"
-version = "1.0.1"
+version = "1.0.2"
 name = "JiggleKit Free - 8-Bone Jiggle Physics"
 tagline = "Free version: 8 simulated bones, bake up to 250 frames"
 maintainer = "Mendbox Studio"

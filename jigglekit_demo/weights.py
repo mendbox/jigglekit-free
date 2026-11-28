@@ -6,6 +6,8 @@ import math
 
 import numpy as np
 
+from .regions import along
+
 
 def graph(n_verts, edges, P):
     """CSR adjacency of the mesh graph with edge lengths |P_u - P_v|."""
@@ -115,7 +117,7 @@ def chain_param(P, J, with_dist=False):
         a, b = J[k], J[k + 1]
         ab = b - a
         dd = float(ab @ ab)
-        t = np.clip(((P - a) @ ab) / max(dd, 1e-30), 0.0, 1.0)
+        t = np.clip(along(P - a, ab) / max(dd, 1e-30), 0.0, 1.0)
         d = np.linalg.norm(P - (a + t[:, None] * ab), axis=1)
         better = d < best_d
         best_d[better] = d[better]
@@ -243,3 +245,42 @@ def combine_sides(Ms, shares):
     safe = np.where(tot > 0.0, tot, 1.0)
     S = np.concatenate([shares[i] * (Ms[:, i] / safe)[:, None] for i in range(len(shares))], axis=1)
     return np.minimum(1.0, tot), S, np.argmax(Ms, axis=1)
+
+
+RADIUS_PERCENTILE = 85.0     # joint_radii: share of a bone's vertices inside its collision radius
+RADIUS_MIN_WEIGHT = 0.5      # ... vertices with at least this much weight on the chain
+RADIUS_MIN_VERTS = 8         # ... fewer vertices on a bone: not measured (0)
+
+
+def joint_radii(P, W, J, thin=True):
+    """Collision radius per bone of a chain from the mesh it carries (1.0.1). P (n,3) vertices, W (n,nb) their
+    weights on the nb chain bones, J (nb+1,3) joints, all in one space. A vertex counts for the bone it has the
+    most weight on, when its chain weights sum to RADIUS_MIN_WEIGHT or more. The radius is half the thickness of
+    the mesh around the bone across its thin side: the offsets of the vertices from the bone are measured along
+    the direction in which they spread least (a ponytail is wide and flat and lies on the back with its flat
+    side; a round strand or tail has no thin side and gets its radius), and the radius is the offset that holds
+    RADIUS_PERCENTILE of them (the bulk of a strand, not its stray hairs). Returns (nb,), 0 where fewer than
+    RADIUS_MIN_VERTS vertices count. thin=False: the distance from the bone in any direction instead (how far
+    the mesh reaches)."""
+    nb = len(J) - 1
+    out = np.zeros(nb)
+    if not len(P) or nb < 1:
+        return out
+    use = W.sum(axis=1) >= RADIUS_MIN_WEIGHT
+    own = np.argmax(W, axis=1)
+    for j in range(nb):
+        X = P[use & (own == j)]
+        if len(X) < RADIUS_MIN_VERTS:
+            continue
+        a, ab = J[j], J[j + 1] - J[j]
+        t = np.clip(along(X - a, ab) / max(float(ab @ ab), 1e-30), 0.0, 1.0)
+        d = X - (a + t[:, None] * ab)
+        if thin:
+            _w, vec = np.linalg.eigh(d.T @ d)             # ascending: [0] is along the bone (offsets ~ 0 there)
+            u = ab / max(float(np.linalg.norm(ab)), 1e-30)
+            k = sorted(range(3), key=lambda i: abs(float(vec[:, i] @ u)))[:2]      # the two axes across the bone
+            side = min(k)                                 # the smaller eigenvalue of the two
+            out[j] = float(np.percentile(np.abs(along(d, vec[:, side])), RADIUS_PERCENTILE))
+        else:
+            out[j] = float(np.percentile(np.sqrt(np.einsum('nj,nj->n', d, d)), RADIUS_PERCENTILE))
+    return out

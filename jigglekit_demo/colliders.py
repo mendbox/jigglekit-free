@@ -7,7 +7,7 @@ the bone axis, at most 2 * bone length. Fewer than 8 vertices: 0.25 * bone lengt
 import bpy
 import numpy as np
 
-from . import ids, model
+from . import ids, model, regions
 from .create_ops import write_result
 
 MIN_VERTS = 8
@@ -85,8 +85,8 @@ def measure_radius(ob, meshes, bone, min_weight):
         if not idx:
             continue
         Mx = np.array(ob.matrix_world.inverted(), dtype=np.float64) @ np.array(me_ob.matrix_world, dtype=np.float64)
-        P = co[idx] @ Mx[:3, :3].T + Mx[:3, 3]
-        tt = ((P - h) @ ab) / max(L2, 1e-30)
+        P = regions.transform(co[idx], Mx)
+        tt = regions.along(P - h, ab) / max(L2, 1e-30)
         inside = (tt > 0.0) & (tt < 1.0)
         Q = h + tt[inside, None] * ab
         rho.extend(np.linalg.norm(P[inside] - Q, axis=1).tolist())

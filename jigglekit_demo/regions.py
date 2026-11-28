@@ -8,6 +8,22 @@ class RegionError(Exception):
     pass
 
 
+def transform(points, matrix):
+    """Points (n, 3) through a 3x3 or 4x4 matrix. Written out per column on purpose, not as a numpy matmul: the
+    BLAS matmul of the numpy in Blender 4.2 and 4.5 on Apple Silicon (Accelerate) raises false "divide by zero /
+    overflow / invalid value" RuntimeWarnings on clean data from about 1,000 points."""
+    x, y, z = points[:, 0:1], points[:, 1:2], points[:, 2:3]
+    out = x * matrix[:3, 0] + y * matrix[:3, 1] + z * matrix[:3, 2]
+    if matrix.shape[1] == 4:
+        out += matrix[:3, 3]
+    return out
+
+
+def along(points, axis):
+    """Points (n, 3) projected on a vector (3,): points @ axis, per column for the same reason as transform()."""
+    return points[:, 0] * axis[0] + points[:, 1] * axis[1] + points[:, 2] * axis[2]
+
+
 def bbox_half_diag(P):
     P = np.asarray(P, dtype=np.float64)
     return 0.5 * float(np.linalg.norm(P.max(axis=0) - P.min(axis=0)))
@@ -67,7 +83,7 @@ def compact(A_sel, N_sel, mesh_center, inside=None):
         if out is not None and float(n @ out) < -OUT_MIN:
             n = -n
             flipped = True
-    proj = (A_sel - c) @ n
+    proj = along(A_sel - c, n)
     smin, smax = float(proj.min()), float(proj.max())
     h = max(smax - smin, 0.2 * R)
     head = c + n * (smin - 0.25 * h)
@@ -93,7 +109,7 @@ def chain(A_sel, segments, base_score=None, parent_seg=None, mesh_size=1.0, axis
         raise RegionError("Chain needs at least one segment.")
     c, _w, V = pca(A_sel)
     a = V[:, 2].copy() if axis is None else np.asarray(axis, dtype=np.float64) / np.linalg.norm(axis)
-    proj = (A_sel - c) @ a
+    proj = along(A_sel - c, a)
     pmin, pmax = float(proj.min()), float(proj.max())
     Lr = pmax - pmin
     q = 0.25 * Lr
@@ -133,7 +149,7 @@ def chain(A_sel, segments, base_score=None, parent_seg=None, mesh_size=1.0, axis
 def max_segments(A_sel, axis, edge_axial, rings_per_bone=3.0):
     """Largest bone count that gives every bone at least rings_per_bone edge rings (a bone spanning fewer rings
     cannot get a smooth linear split: the weight changes by more than 1/rings_per_bone per edge)."""
-    proj = (np.asarray(A_sel, dtype=np.float64) @ np.asarray(axis, dtype=np.float64))
+    proj = along(np.asarray(A_sel, dtype=np.float64), np.asarray(axis, dtype=np.float64))
     if edge_axial <= 0.0:
         return 12
     return max(1, int(np.floor((float(proj.max() - proj.min())) / (rings_per_bone * edge_axial) + 1e-9)))
@@ -247,7 +263,7 @@ def base_near(P, seg, band=0.15, min_count=3):
     a, b = (np.asarray(x, dtype=np.float64) for x in seg)
     ab = b - a
     dd = float(ab @ ab)
-    t = np.clip(((P - a) @ ab) / dd, 0.0, 1.0) if dd > 1e-30 else np.zeros(len(P))
+    t = np.clip(along(P - a, ab) / dd, 0.0, 1.0) if dd > 1e-30 else np.zeros(len(P))
     d = np.linalg.norm(P - (a + t[:, None] * ab), axis=1)
     m = d <= d.min() + band * (d.max() - d.min())
     if int(m.sum()) < min(min_count, len(P)):

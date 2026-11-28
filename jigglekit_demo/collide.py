@@ -28,25 +28,33 @@ def segments(A, B):
     return AB, inv
 
 
-def push(X, r, A, AB, inv_ab2, R, active=None):
+def limits(r, R):
+    """Smallest allowed distance between each point and each collider axis, (n,c): collider radius + point radius.
+    sim.step lowers it to the distance in the rest pose for chains with Rest Contact (sim.Model.set_rest)."""
+    return R[None, :] + r[:, None]
+
+
+def push(X, r, A, AB, inv_ab2, R, active=None, lim=None):
     """Push points X (n,3) with radii r (n,) out of the colliders. Returns (new X, number of contacts).
-    active (n,) bool: points that collide at all (chain.collide); None = all."""
+    active (n,) bool: points that collide at all (chain.collide); None = all. lim (n,c): the allowed distances
+    instead of R + r (limits())."""
     n, c = X.shape[0], A.shape[0]
     if n == 0 or c == 0:
         return X, 0
+    if lim is None:
+        lim = limits(r, R)
     Q = closest(X, A, AB, inv_ab2)
     d = X[:, None, :] - Q
     dist = np.sqrt(np.einsum('ncj,ncj->nc', d, d))
-    pen = R[None, :] + r[:, None] - dist
-    hit = pen > 0.0
+    hit = lim > dist
     if active is not None:
         hit &= active[:, None]
     if not hit.any():
         return X, 0
-    return _apply(X, r, A, AB, inv_ab2, R, np.nonzero(hit.any(axis=0))[0], active)
+    return _apply(X, lim, A, AB, inv_ab2, np.nonzero(hit.any(axis=0))[0], active)
 
 
-def _apply(X, r, A, AB, inv_ab2, R, cols, active):
+def _apply(X, lim, A, AB, inv_ab2, cols, active):
     """The colliders cols (ascending index) one after another on all points (vectorized over points)."""
     X = X.copy()
     contacts = 0
@@ -57,7 +65,7 @@ def _apply(X, r, A, AB, inv_ab2, R, cols, active):
         np.minimum(t, 1.0, out=t)
         dv = X - (a[None, :] + t[:, None] * AB[ci][None, :])
         dd = np.sqrt(np.einsum('nj,nj->n', dv, dv))
-        p = R[ci] + r - dd
+        p = lim[:, ci] - dd
         m = p > 0.0
         if active is not None:
             m &= active
@@ -67,39 +75,43 @@ def _apply(X, r, A, AB, inv_ab2, R, cols, active):
     return X, contacts
 
 
-def push_bone(H, P, r, A, AB, inv_ab2, R, active=None):
+def push_bone(H, P, r, A, AB, inv_ab2, R, active=None, lim_p=None, lim_m=None):
     """Collision of one bone (spec 5.4): first the particle P (tail), then the bone middle (H + P) / 2.
-    A push of the middle moves the particle twice as far (the head stays). Returns (new P, contacts)."""
-    P, c1 = push(P, r, A, AB, inv_ab2, R, active)
+    A push of the middle moves the particle twice as far (the head stays). Returns (new P, contacts).
+    lim_p, lim_m (n,c): allowed distances of the particle and of the middle instead of R + r."""
+    P, c1 = push(P, r, A, AB, inv_ab2, R, active, lim_p)
     M = 0.5 * (H + P)
-    M2, c2 = push(M, r, A, AB, inv_ab2, R, active)
+    M2, c2 = push(M, r, A, AB, inv_ab2, R, active, lim_m)
     if c2:
         P = 2.0 * M2 - H
     return P, c1 + c2
 
 
-def resolve(H, P, r, A, AB, inv_ab2, R, active=None):
+def resolve(H, P, r, A, AB, inv_ab2, R, active=None, lim_p=None, lim_m=None):
     """push_bone() with one shared contact test of the particle and the bone middle (the common case of no
     contact costs one batch). Same result as push_bone: when the particle is not pushed, the middle tested here
     is the middle push_bone would test; when it is pushed, the middle is tested again."""
     n = len(P)
+    if lim_p is None:
+        lim_p = limits(r, R)
+    if lim_m is None:
+        lim_m = lim_p
     X = np.concatenate((P, 0.5 * (H + P)))
     Q = closest(X, A, AB, inv_ab2)
     d = X[:, None, :] - Q
     dist = np.sqrt(np.einsum('ncj,ncj->nc', d, d))
-    rr = np.concatenate((r, r))
-    hit = (R[None, :] + rr[:, None] - dist) > 0.0
+    hit = np.concatenate((lim_p, lim_m)) > dist
     if active is not None:
         hit &= np.concatenate((active, active))[:, None]
     if not hit.any():
         return P, 0
     hp = hit[:n]
     if hp.any():
-        P, c1 = _apply(P, r, A, AB, inv_ab2, R, np.nonzero(hp.any(axis=0))[0], active)
-        M2, c2 = push(0.5 * (H + P), r, A, AB, inv_ab2, R, active)
+        P, c1 = _apply(P, lim_p, A, AB, inv_ab2, np.nonzero(hp.any(axis=0))[0], active)
+        M2, c2 = push(0.5 * (H + P), r, A, AB, inv_ab2, R, active, lim_m)
     else:
         c1 = 0
-        M2, c2 = _apply(X[n:], r, A, AB, inv_ab2, R, np.nonzero(hit[n:].any(axis=0))[0], active)
+        M2, c2 = _apply(X[n:], lim_m, A, AB, inv_ab2, np.nonzero(hit[n:].any(axis=0))[0], active)
     if c2:
         P = 2.0 * M2 - H
     return P, c1 + c2

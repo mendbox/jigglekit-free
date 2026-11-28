@@ -26,11 +26,17 @@ except ImportError:          # imported as a top-level module (pure tests)
                        OMEGA_DT_MAX, ROT_INTERP_MAX)
 
 CHAIN_DEFAULTS = dict(stiffness=0.30, damping=0.14, inertia=0.90, gravity=0.0, angle_limit=math.radians(30.0),
-                      tip_ratio=1.0, tip_damping=1.0, buckle=0.0, radius=0.0, collide=True, influence=1.0)
+                      tip_ratio=1.0, tip_damping=1.0, buckle=0.0, radius=0.0, collide=True, influence=1.0,
+                      rest_contact=False)
 CHAIN_REF_BONES = 4.0        # chain factor: the sliders describe a chain of this many equal bones
 CHAIN_COUNT_MIN = 2.0        # ... and a chain counts as at least this many bones
 CHAIN_COUNT_MAX = 8.0        # ... and at most this many
 SHORT_BONE_MAX = 4.0         # cap of the short-bone factor (longest bone of the chain / this bone)
+REST_REACH = 1.25            # Rest Contact: a bone within this x (collider radius + bone radius) at rest lies on it
+REST_FRICTION = 0.8          # share of the sliding along a rest sphere that is lost in 1/48 s of contact (tuned on
+                             # the tutorial scene of 2026-11-28: with 0 and 0.5 the strand slid off sideways)
+FRICTION_RATE = 48.0         # ... per substep 1 - (1 - REST_FRICTION) ** (FRICTION_RATE * dt): the same at every fps
+REST_SLACK = 1e-6            # Rest Contact: the allowed distance is this much (relative and in units) under rest
 BUCKLE_SEED = 0.05           # weight of the bone's own Z axis in the bow direction (a straight strand along gravity)
 
 
@@ -54,9 +60,12 @@ class Model:
         per = {k: np.zeros(N) for k in ('k', 'damping', 'inertia', 'gravity', 'limit', 'radius', 'influence',
                                         'buckle')}
         self.collide = np.zeros(N, dtype=bool)
+        self.rest_contact = np.zeros(N, dtype=bool)
+        self.rest_p = self.rest_m = None             # set_rest(): rest-pose distances, armature units
         for ci, c in enumerate(chains):
             p = dict(CHAIN_DEFAULTS)
             p.update({k: v for k, v in c.items() if k in CHAIN_DEFAULTS})
+            radii = c.get('radii')                       # per bone (measured from the mesh) instead of radius
             n = lens[ci]
             s0 = int(start[ci])
             total = float(sum(float(x) for x in c['lengths']))
@@ -103,9 +112,10 @@ class Model:
                 per['inertia'][i] = p['inertia']
                 per['gravity'][i] = p['gravity']
                 per['limit'][i] = p['angle_limit']
-                per['radius'][i] = p['radius']
+                per['radius'][i] = p['radius'] if radii is None else float(radii[j])
                 per['influence'][i] = p['influence']
                 self.collide[i] = bool(p['collide'])
+                self.rest_contact[i] = bool(p['rest_contact'])
                 if j > 0:
                     self.par[i] = i - 1
             kind = c['parent'][0]
@@ -139,6 +149,27 @@ class Model:
                 idx = np.array([start[c] + j for c in wave if lens[c] > j], dtype=np.int64)
                 self.schedule.append((idx, self.par[idx]))
         self._layout(lens, start)
+
+    def set_rest(self, tails, mids, col_a, col_b):
+        """Rest Contact (1.0.1): distances in the rest pose between every bone (tail and middle, (N,3)) and every
+        collider axis (col_a, col_b (C,3); a row of NaN = a collider without a rest pose, an object), all in
+        armature space. In step() a bone of a chain with rest_contact that is near a collider in the rest pose
+        keeps at least this distance from it and is never pushed further than it (_rest_limit). A strand that
+        lies on the body in the rest pose keeps lying there (it is not pushed off by a large radius) and cannot
+        go deeper than it was modelled. Chains without rest_contact: as in 1.0.0."""
+        self.rest_p = self.rest_m = None
+        C = len(col_a)
+        if not C or not self.N or not self.rest_contact.any():
+            return
+        out = []
+        for X in (tails, mids):
+            d = collide.distance(np.asarray(X, dtype=np.float64), np.asarray(col_a, dtype=np.float64),
+                                 np.asarray(col_b, dtype=np.float64))
+            d = d * (1.0 - REST_SLACK) - REST_SLACK          # a pose exactly at rest is not a contact
+            d[~np.isfinite(d)] = np.inf
+            d[~self.rest_contact] = np.inf
+            out.append(d[self.perm])
+        self.rest_p, self.rest_m = out
 
     def _layout(self, lens, start):
         """Internal bone order for step(): wave by wave, bone index by bone index, and inside a wave the chains
@@ -233,10 +264,10 @@ class Frame:
     """Inputs of one frame (read from the evaluated armature by runtime.py, or made by tests).
     ext (E,4,4): world matrices of external parents; banim (N,4,4): matrix_basis of simulated bones;
     q_anim (N,4): their authored quaternions (w, x, y, z); colliders: col_a, col_b (C,3) world points and
-    col_r (C,) world radii; scale: uniform world scale; gravity (3,) in BU/s^2."""
+    col_r (C,) world radii; scale: uniform world scale; gravity (3,) in BU/s^2; rs_c, rs_r: rest spheres."""
 
     def __init__(self, ext, banim, q_anim, col_a=None, col_b=None, col_r=None, scale=1.0,
-                 gravity=(0.0, 0.0, 0.0), fps=24.0, time_scale=1.0):
+                 gravity=(0.0, 0.0, 0.0), fps=24.0, time_scale=1.0, rs_c=None, rs_r=None):
         self.ext = np.asarray(ext, dtype=np.float64).reshape(-1, 4, 4)
         self.banim = np.asarray(banim, dtype=np.float64).reshape(-1, 4, 4)
         self.q_anim = np.asarray(q_anim, dtype=np.float64).reshape(-1, 4)
@@ -248,6 +279,10 @@ class Frame:
         self.gravity = np.asarray(gravity, dtype=np.float64)
         self.fps = float(fps)
         self.time_scale = float(time_scale)
+        # Rest Contact, rest spheres (1.0.1): per simulated bone a sphere its tail stays out of, world centre
+        # (N,3) and radius (N,), radius 0 = none. None = no bone has one.
+        self.rs_c = None if rs_c is None else np.asarray(rs_c, dtype=np.float64).reshape(-1, 3)
+        self.rs_r = None if rs_r is None else np.asarray(rs_r, dtype=np.float64).ravel()
 
 
 class State:
@@ -263,6 +298,7 @@ class State:
         self.ext_t = np.zeros((E, 3))
         self.col_a = np.zeros((0, 3))
         self.col_b = np.zeros((0, 3))
+        self.rs_c = None                # rest sphere centres of the last step (substep interpolation)
         self.valid = False
         self.nan_resets = 0
         self.contacts = 0
@@ -388,6 +424,7 @@ def reset(m, st, fr):
     st.ext_t = fr.ext[:, :3, 3].copy()
     st.col_a = fr.col_a.copy()
     st.col_b = fr.col_b.copy()
+    st.rs_c = None if fr.rs_c is None else fr.rs_c.copy()
     st.q_prev = fr.q_anim.copy()
     st.valid = True
     st.n_sub = 0
@@ -443,9 +480,23 @@ def step(m, st, fr, n_frames=1):
             st.col_a, st.col_b = fr.col_a.copy(), fr.col_b.copy()
         col_r = fr.col_r
         radius = m.i_radius * fr.scale
+        lim_p = collide.limits(radius, col_r)
+        lim_m = lim_p
+        if m.rest_p is not None and m.rest_p.shape[1] == C:
+            lim_m = _rest_limit(lim_p, m.rest_m * fr.scale)
+            lim_p = _rest_limit(lim_p, m.rest_p * fr.scale)
         near_rows = _near_bones(m, st, fr, LL, Rc, tc, big, lc)
         if near_rows is None:
             use_col = False                               # no collider can reach any chain in this step
+    rs = fr.rs_r is not None and len(fr.rs_r) == N and bool((fr.rs_r > 0.0).any())
+    if rs:
+        rs_r = fr.rs_r * (1.0 - REST_SLACK)                # a pose exactly at rest is not a contact
+        rs_c1 = fr.rs_c
+        rs_c0 = st.rs_c if st.rs_c is not None and st.rs_c.shape == rs_c1.shape else rs_c1
+        if not m.identity:
+            rs_r, rs_c1, rs_c0 = rs_r[perm], rs_c1[perm], rs_c0[perm]
+        rs_d = rs_c1 - rs_c0
+        rs_on = [bool(rs_r[bt['sl']].any()) for bt in m.batches]
     if m.identity:
         P, V, Tprev = st.P, st.V, st.Tprev
     else:
@@ -477,7 +528,9 @@ def step(m, st, fr, n_frames=1):
                 A = st.col_a + alpha * (fr.col_a - st.col_a)
                 B = st.col_b + alpha * (fr.col_b - st.col_b)
             AB, inv_ab2 = collide.segments(A, B)
-        for bt in m.batches:
+        if rs:
+            RC = rs_c1 if last else rs_c0 + alpha * rs_d
+        for bi, bt in enumerate(m.batches):
             sl = bt['sl']
             par = bt['par']
             Rp, tp = R_all[par], t_all[par]
@@ -516,16 +569,28 @@ def step(m, st, fr, n_frames=1):
                 Pi += push
             # 5. constraints: angle limit, rigid length, colliders (+ length again), two passes
             check = use_col and bt['collide'] and near_rows[sl].any()
+            rsb = rs and rs_on[bi]
+            touched = False
             for _ in range(CONSTRAINT_PASSES):
                 _limit_and_length(Pi, H, da, L, bt['cos'], bt['sin'])
-                if not check:
-                    break                    # nothing moved P after the projection: a second pass changes nothing
-                Pr, nc = collide.resolve(H, Pi, radius[sl], A, AB, inv_ab2, col_r, bt['act'])
+                nc = 0
+                Pr = Pi
+                if rsb:
+                    nc = _rest_spheres(Pi, RC[sl], rs_r[sl])
+                if check:
+                    Pr, n2 = collide.resolve(H, Pi, radius[sl], A, AB, inv_ab2, col_r, bt['act'], lim_p[sl],
+                                             lim_m[sl])
+                    nc += n2
                 if not nc:
-                    break
+                    break                    # nothing moved P after the projection: another pass changes nothing
                 contacts += nc
+                touched = touched or rsb
                 v = Pr - H
                 Pi[:] = H + _unit_rows(v, np.sqrt(np.einsum('nj,nj->n', v, v)), da) * L[:, None]
+            if touched and REST_FRICTION > 0.0:
+                # Rest Contact, friction: a tail that lies on its rest sphere is carried along by the body
+                _rest_friction(Pi, Pold, keep[sl] * delta, RC[sl], rs_r[sl], rs_d[sl] * (1.0 / n_sub), H, L,
+                               1.0 - (1.0 - REST_FRICTION) ** (FRICTION_RATE * dt))
             # 6. velocity from position
             np.subtract(Pi, Pold, out=Vi)
             Vi *= inv_dt
@@ -553,12 +618,53 @@ def step(m, st, fr, n_frames=1):
     st.ext_t = tc.copy()
     if use_col:
         st.col_a, st.col_b = fr.col_a.copy(), fr.col_b.copy()
+    st.rs_c = fr.rs_c.copy() if rs else None
     st.contacts = contacts
     u, th = _axis_angle(da_last, ds_last)
     q = _outputs(m, st, fr, Rp_last, u, th)
     _nan_guard(m, st, fr, q)
     st.q_prev = q.copy()
     return q
+
+
+def _rest_spheres(P, C, R):
+    """Rest Contact, rest spheres: push the tails P (n,3) out of their own spheres (centre C (n,3), radius R (n,),
+    0 = none), in place. Returns the number of contacts. The sphere of a bone touches the bone's tail in the
+    rest pose from the side of the body (runtime.ArmRT.set_rest_spheres): the tail can slide along the body and
+    swing away from it, and never goes deeper than it lies at rest."""
+    d = P - C
+    dist = np.sqrt(np.einsum('nj,nj->n', d, d))
+    pen = R - dist
+    hit = pen > 0.0
+    if not hit.any():
+        return 0
+    P[hit] += d[hit] * (pen[hit] / np.maximum(dist[hit], 1e-300))[:, None]
+    return int(hit.sum())
+
+
+def _rest_friction(P, Pold, shift, C, R, dC, H, L, mu):
+    """Friction of the tails that touch their rest spheres at the end of a substep, in place: the part of the
+    tail's motion along the sphere, relative to the sphere (the body it stands for), is cut by mu; the length is
+    restored. Pold - shift is the tail at the start of the substep, dC the sphere's motion in the substep."""
+    d = P - C
+    dist = np.sqrt(np.einsum('nj,nj->n', d, d))
+    on = (R > 0.0) & (dist <= R * (1.0 + 1e-4))
+    if not on.any():
+        return
+    n = d[on] / np.maximum(dist[on], 1e-300)[:, None]
+    rel = P[on] - Pold[on] + shift[on] - dC[on]
+    rel -= n * np.einsum('nj,nj->n', rel, n)[:, None]
+    Q = P[on] - mu * rel
+    v = Q - H[on]
+    P[on] = H[on] + v * (L[on] / np.maximum(np.sqrt(np.einsum('nj,nj->n', v, v)), 1e-300))[:, None]
+
+
+def _rest_limit(lim, rest):
+    """Rest Contact: the allowed distance bone - collider axis. Where the bone is within REST_REACH x (collider
+    radius + bone radius) of the axis in the rest pose it is the rest distance: the bone lies on that collider
+    (or in it, or just off it: capsules are smaller than the body they stand for), it is not pushed away from
+    there and never comes closer. Further away at rest: radius + radius as always."""
+    return np.where(rest < REST_REACH * lim, rest, lim)
 
 
 def _buckle(Pold, V, dt, H, L, Ra, g_hat, gain):

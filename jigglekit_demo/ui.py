@@ -181,12 +181,21 @@ class JIGGLEKIT_PT_chains(_Sub, bpy.types.Panel):
         col = layout.column()
         col.use_property_split = True
         col.use_property_decorate = False
-        for k in ("stiffness", "damping", "inertia", "gravity", "angle_limit", "tip_ratio", "tip_damping", "buckle",
-                  "radius", "collide", "influence"):
+        for k in ("stiffness", "damping", "inertia", "gravity", "angle_limit", "tip_ratio", "tip_damping", "buckle"):
+            col.prop(ch, k)
+        sub = col.column()
+        sub.active = not (ch.mesh_radius and measured_radius(arm, ch))
+        sub.prop(ch, "radius")
+        for k in ("mesh_radius", "rest_contact", "collide", "influence"):
             col.prop(ch, k)
         row = layout.row(align=True)
         row.operator("jigglekit.copy_chain_settings", text="Copy to Selected", icon='COPYDOWN')
         row.operator("jigglekit.remove_chain", text="Remove", icon='X')
+
+
+def measured_radius(arm, ch):
+    """True when a bone of the chain has a radius measured from the mesh (Radius from Mesh then replaces Radius)."""
+    return any(pb.jigglekit.chain_id == ch.id and pb.jigglekit.radius > 0.0 for pb in arm.pose.bones)
 
 
 class JIGGLEKIT_PT_colliders(_Sub, bpy.types.Panel):

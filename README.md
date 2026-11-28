@@ -73,7 +73,7 @@ The simulation can be turned off and on for the whole rig, so you can compare wi
 
 ## Install
 
-1. Download `jigglekit_demo-1.0.1.zip` from the [latest release](https://github.com/mendbox/jigglekit-free/releases/latest). Do not unzip it.
+1. Download `jigglekit_demo-1.0.2.zip` from the [latest release](https://github.com/mendbox/jigglekit-free/releases/latest). Do not unzip it.
 2. In Blender: **Edit > Preferences > Get Extensions**, open the menu in the top right corner (the arrow), choose **Install from Disk...** and pick the zip. (You can also drag the zip into the Blender window.)
 3. Make sure the add-on is switched on. The panel is in the 3D Viewport sidebar (press **N**), tab **JiggleKit**.
 

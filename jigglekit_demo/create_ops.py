@@ -9,6 +9,7 @@ PoseBone.jigglekit; the live simulation starts through model.rebuild().
 Also here: add_chains_from_bones (chains on existing bones, no weights) and paint_weights (Weights for Selection:
 the same weight path for a second mesh, e.g. clothing)."""
 import json
+import math
 import re
 import time
 
@@ -263,8 +264,8 @@ def plan_create(ob, s):
             if msg not in warn:
                 warn.append(msg)
     Mx = _np(arm.matrix_world.inverted()) @ _np(ob.matrix_world)
-    A = co @ Mx[:3, :3].T + Mx[:3, 3]
-    Nn = nr @ np.linalg.inv(Mx[:3, :3])          # normal matrix = inverse transpose
+    A = regions.transform(co, Mx)
+    Nn = regions.transform(nr, np.linalg.inv(Mx[:3, :3]).T)   # normal matrix = inverse transpose
     Nn /= np.maximum(np.linalg.norm(Nn, axis=1), 1e-30)[:, None]
     D = float(np.linalg.norm(A.max(axis=0) - A.min(axis=0)))
     mesh_center = A.mean(axis=0)
@@ -386,7 +387,7 @@ def plan_create(ob, s):
         a_est = axis if axis is not None else regions.pca(A[sel])[2][:, 2]
         es = edges[sel[edges[:, 0]] & sel[edges[:, 1]]]
         ev = A[es[:, 1]] - A[es[:, 0]]
-        along = np.abs(ev @ a_est)
+        along = np.abs(regions.along(ev, a_est))
         axial = along[along > 0.7 * np.linalg.norm(ev, axis=1)]
         e_ax = float(np.median(axial)) if len(axial) else 0.0
         n_cap = regions.max_segments(A[sel], a_est, e_ax)
@@ -591,9 +592,168 @@ def add_chain(arm, cid, name, preset, mean_len):
     ch.id = cid
     ch.name = name[:40]
     presets.apply_to_chain(ch, preset, props.applying, mean_bone_length=mean_len)
+    ch.rest_contact = True       # 1.0.1: new chains keep their rest distance to the colliders
     jk.chain_index = len(jk.chains) - 1
     runtime.invalidate()
     return ch
+
+
+CONTACT_REACH = 1.5          # a bone lies on the body when the body is within this x its mesh radius of its tail
+CONTACT_TANGENT = 0.5        # ... and the bone runs along the body: |normal . bone direction| at most this (30 deg)
+CONTACT_MIN_VERTS = 8
+CONTACT_PATCH = 0.5          # the patch of body vertices that gives the normal: nearest distance + this x bone length
+
+
+def mesh_weights(arm, cache):
+    """[(mesh object, vertices (n,3) in armature space, {vertex group index: (vertex indices, weights)})] of the
+    meshes with an Armature modifier on this armature that are not in Edit Mode. Read once per operator (cache:
+    a dict the caller keeps for the call): the weights of a big mesh are a Python loop over its vertices."""
+    if 'meshes' in cache:
+        return cache['meshes']
+    out = []
+    inv = _np(arm.matrix_world.inverted())
+    for ob in bpy.data.objects:
+        if ob.type != 'MESH' or ob.mode == 'EDIT' \
+                or not any(md.type == 'ARMATURE' and md.object == arm for md in ob.modifiers):
+            continue
+        me = ob.data
+        co = np.empty(len(me.vertices) * 3, dtype=np.float32)
+        me.vertices.foreach_get("co", co)
+        Mx = inv @ _np(ob.matrix_world)
+        A = regions.transform(co.reshape(-1, 3).astype(np.float64), Mx)
+        groups = {}
+        if len(ob.vertex_groups):
+            for v in me.vertices:
+                for g in v.groups:
+                    if g.weight > 0.0:
+                        e = groups.get(g.group)
+                        if e is None:
+                            e = groups[g.group] = ([], [])
+                        e[0].append(v.index)
+                        e[1].append(g.weight)
+        out.append((ob, A, {k: (np.array(i, dtype=np.int64), np.array(w)) for k, (i, w) in groups.items()}))
+    cache['meshes'] = out
+    return out
+
+
+def measure_radii(arm, chain_id, cache=None):
+    """Radius from Mesh and Rest Contact (1.0.1): what the chain's mesh says about collisions. Reads every mesh
+    with an Armature modifier on this armature (rest coordinates) and stores per bone (PoseBone.jigglekit):
+
+    radius: how thick the mesh weighted to the bone is around it (weights.joint_radii); a bone without enough
+    vertices keeps 0 = the chain's Radius.
+    contact_bone, contact_n: when the bone lies on the body in the rest pose (measure_contact), the body bone
+    under it and the direction from the body to the bone's tail; the runtime keeps the tail from going deeper.
+
+    Chains of two or more bones only: a one-bone region (chest, belly) keeps the preset radius. Turns the chain's
+    Radius from Mesh and Rest Contact on when something was measured. Returns the radii (armature units) or None."""
+    ch = ids.find_chain(arm, chain_id)[1]
+    names = [n for _i, n in sorted((pb.jigglekit.index, pb.name) for pb in arm.pose.bones
+                                   if pb.jigglekit.chain_id == chain_id)]
+    if ch is None or len(names) < 2:
+        return None
+    db = arm.data.bones
+    J = np.array([np.array(db[names[0]].head_local)] + [np.array(db[n].tail_local) for n in names])
+    Ps, Ws, body = [], [], []
+    for ob, A, groups in mesh_weights(arm, {} if cache is None else cache):
+        on_chain = np.zeros(len(A), dtype=bool)
+        W = None
+        for vg in ob.vertex_groups:
+            if vg.name in names and vg.index in groups:
+                if W is None:
+                    W = np.zeros((len(A), len(names)))
+                idx, w = groups[vg.index]
+                W[idx, names.index(vg.name)] = w
+        if W is not None:
+            on_chain = W.sum(axis=1) > 0.0
+            Ps.append(A[on_chain])
+            Ws.append(W[on_chain])
+        body.append((ob, A, ~on_chain, bool(on_chain.any())))
+    if not Ps:
+        return None
+    P, W = np.concatenate(Ps), np.concatenate(Ws)
+    rr = weights.joint_radii(P, W, J)
+    if not (rr > 0.0).any():
+        return None
+    reach = weights.joint_radii(P, W, J, thin=False)
+    cc = measure_contact(arm, names, J, reach, body)
+    for n, r, c in zip(names, rr, cc):
+        jb = arm.pose.bones[n].jigglekit
+        jb.radius = float(r)
+        jb.contact_bone = ids.ensure_bone_id(arm.pose.bones[c[0]]) if c else ""
+        jb.contact_n = c[1] if c else (0.0, 0.0, 0.0)
+    ch.mesh_radius = True
+    ch.rest_contact = True
+    arm.jigglekit.version += 1
+    return [round(float(r), 4) for r in rr]
+
+
+def measure_contact(arm, names, J, reach, body):
+    """Which bones of a chain lie on the body in the rest pose. names: the chain bones; J (nb+1,3) joints; reach
+    (nb,): how far the bone's mesh reaches from the bone in any direction; body: [(mesh object, vertices (n,3) in
+    armature space, mask of the vertices that are not on the chain, the mesh carries the chain)]. A bone lies on the body when the nearest
+    body vertex is within CONTACT_REACH x reach of its tail (the bone's mesh touches the body there) and the bone
+    runs along the surface (CONTACT_TANGENT; a bone that points out of the body, as the first bone of a tail,
+    must be free to swing). The body is the other meshes on the armature; only when none of them is in reach,
+    the rest of the meshes that carry the chain (hair joined to the head). The direction from the body to the
+    tail is taken from the patch of body vertices under the tail (within nearest distance + CONTACT_PATCH x
+    bone length), the body bone is the one with the most weight on the nearest vertices; simulated bones do
+    not count. Returns per bone None or (body bone name, normal)."""
+    pbs = arm.pose.bones
+    sim = set()
+    for pb in pbs:
+        p = pb
+        while p is not None:
+            if p.jigglekit.chain_id:
+                sim.add(pb.name)
+                break
+            p = p.parent
+    out = []
+    for j, name in enumerate(names):
+        out.append(None)
+        X = J[j + 1]
+        u = J[j + 1] - J[j]
+        L = float(np.linalg.norm(u))
+        if reach[j] <= 0.0 or L <= 1e-9:
+            continue
+        near = []                                    # (distance, mesh number, vertex) of the nearest body vertices
+        patch, d_near = [], math.inf
+        for own in (False, True):                    # the body is another mesh; else the rest of the chain's mesh
+            for k, (_ob, A, free, carries) in enumerate(body):
+                if carries != own:
+                    continue
+                d = np.sqrt(np.einsum('nj,nj->n', A - X, A - X))
+                d[~free] = np.inf
+                if not np.isfinite(d).any():
+                    continue
+                d_near = min(d_near, float(d.min()))
+                idx = np.argpartition(d, min(CONTACT_MIN_VERTS, len(d) - 1))[:CONTACT_MIN_VERTS]
+                near.extend((float(d[i]), k, int(i)) for i in idx if np.isfinite(d[i]))
+                patch.append((A, d))
+            if near and d_near <= CONTACT_REACH * reach[j]:
+                break
+        if not near or d_near > CONTACT_REACH * reach[j]:
+            continue
+        pts = np.concatenate([A[d <= d_near + CONTACT_PATCH * L] for A, d in patch])
+        if len(pts) < CONTACT_MIN_VERTS:
+            continue
+        nrm = X - pts.mean(axis=0)
+        ln = float(np.linalg.norm(nrm))
+        if ln <= 1e-9 or abs(float(nrm @ u)) / (ln * L) > CONTACT_TANGENT:
+            continue
+        near.sort()
+        score = {}
+        for _d, k, i in near[:CONTACT_MIN_VERTS]:
+            ob = body[k][0]
+            gname = [vg.name for vg in ob.vertex_groups]
+            for g in ob.data.vertices[i].groups:
+                bn = gname[g.group]
+                if bn in pbs and bn not in sim:
+                    score[bn] = score.get(bn, 0.0) + g.weight
+        if not score:
+            continue
+        out[-1] = (max(score, key=score.get), tuple(float(x) for x in nrm / ln))
+    return out
 
 
 def remove_chains(arm, chain_ids):
@@ -740,6 +900,9 @@ def execute_plan(context, plan):
     vl.objects.active = plan['ob']
     plan['ob'].select_set(True)
     plan['arm'].select_set(True)
+    if plan['ob'].mode == 'OBJECT':
+        cache = {}
+        plan['radii'] = [measure_radii(plan['arm'], sd['chain_id'], cache) for sd in plan['sides']]
     rt = model.rebuild(plan['arm'])
     plan['timings'].update(bones=t1 - t0, write_weights=t2 - t1)
     return rt
@@ -852,6 +1015,7 @@ class JIGGLEKIT_OT_create_from_selection(bpy.types.Operator):
                    parents=[sd['parent'] for sd in plan['sides']], parent_how=[sd['how'] for sd in plan['sides']],
                    joints=[np.round(sd['J'], 4).tolist() for sd in plan['sides']],
                    band=[np.round(sd['band'], 4).tolist() for sd in plan['sides']],
+                   radii=plan.get('radii', []),
                    timings={k: round(v * 1000.0, 2) for k, v in plan['timings'].items()})
         write_result(context.scene, res)
         for w in plan['warn']:
@@ -907,7 +1071,7 @@ def plan_paint(ob, ui):
                 < regions.LINE_SHARE:
             raise CreateError(whole_part_error(ui.limit_ratio, sums, "chain", active_hint=False))
     Mx = _np(arm.matrix_world.inverted()) @ _np(ob.matrix_world)
-    A = co @ Mx[:3, :3].T + Mx[:3, 3]
+    A = regions.transform(co, Mx)
     J = np.array([np.array(db[names[0]].head_local)] + [np.array(db[n].tail_local) for n in names])
     root = db[names[0]]
     parent = root.parent.name if root.parent is not None else None
@@ -957,6 +1121,8 @@ class JIGGLEKIT_OT_paint_weights(bpy.types.Operator):
         try:
             bpy.ops.object.mode_set(mode='OBJECT')
             write_weights(context, plan)
+            ch = active_chain(plan['arm'])
+            plan['radii'] = measure_radii(plan['arm'], ch.id) if ch is not None else None
             bpy.ops.object.mode_set(mode='EDIT')
         except Exception as e:  # noqa: BLE001
             import traceback
@@ -972,7 +1138,7 @@ class JIGGLEKIT_OT_paint_weights(bpy.types.Operator):
         sd = plan['sides'][0]
         res.update(ok=True, messages=plan['warn'], bones=sd['names'], chain=plan['chain'],
                    counts=dict(vertices=plan['touched'], groups=len(plan.get('created_groups', []))),
-                   band=np.round(sd['band'], 4).tolist(),
+                   band=np.round(sd['band'], 4).tolist(), radii=plan.get('radii'),
                    timings={k: round(v * 1000.0, 2) for k, v in plan['timings'].items()})
         write_result(context.scene, res)
         for w in plan['warn']:
@@ -1066,6 +1232,7 @@ def add_chains(arm, preset, sel_names, convert=False, full_scale=False, scale=No
     if len(paths) > 1:
         msgs.append("Selected bones do not form a parent-child path; created %d chains." % len(paths))
     made, n_bones = [], 0
+    cache = {}                   # mesh weights, read once for all the chains made here (measure_radii)
     coll = arm.data.collections.get(COLLECTION)
     if coll is None and not model.bones_locked(arm):        # linked armature data: no new bone collection
         coll = arm.data.collections.new(COLLECTION)
@@ -1138,6 +1305,7 @@ def add_chains(arm, preset, sel_names, convert=False, full_scale=False, scale=No
         if not shown:
             show_collection(coll, msgs)
             shown = True
+        measure_radii(arm, cid, cache)
         made.append(name)
         n_bones += len(path)
     return made, n_bones, msgs, euler

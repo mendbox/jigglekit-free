@@ -30,6 +30,7 @@ MEDIAN_FRAMES = 30         # status line: rolling median of the simulation time 
 SLOW_MS = 20.0             # above this median the panel suggests Bake (Pavel's request 2026-11-23)
 _REDRAW = [0.0]
 LOW_FPS_NOTE = "Frame rate is very low for stable simulation (under 6 fps or Time Scale over 3)."
+REST_SPHERE = 1.0          # radius of a rest sphere / length of its chain (set_rest_spheres)
 COLLIDER_OFF = -1.0e9      # radius of a collider whose object is gone: no contact is possible (not a point at 0)
 HIST_FRAMES = 4            # results of the last integer frames kept for sub-frame evaluations (motion blur)
 RESCAN_CALLS = 48          # the armature list of a scene is rebuilt at least every this many handler calls
@@ -130,6 +131,9 @@ class ArmRT:
                                        t1=float(c.get('t1', 1.0 if c.get('shape', 'CAPSULE') == 'CAPSULE' else 0.0)),
                                        off=np.array(c.get('offset', (0.0, 0.0, 0.0)), dtype=np.float64),
                                        shape=c.get('shape', 'CAPSULE')))
+        self.sim_names = sim_names
+        self.set_rest(ob)
+        self.set_rest_spheres(ob, chains, index)
         self.buf16 = np.zeros(self.n_pose * 16, dtype=np.float32)
         self.buf4 = np.zeros(self.n_pose * 4, dtype=np.float32)
         self.last_frame = None
@@ -157,6 +161,73 @@ class ArmRT:
         self.last_sig = None
         self.recording = False         # bake: no cache, no frame_start restart, q of every frame into record
         self.record = {}
+
+    def set_rest(self, ob):
+        """Rest Contact: the rest-pose places of the simulated bones and of the bone colliders (armature space)
+        for sim.Model.set_rest. Object colliders have no rest pose (NaN): radius + radius as before."""
+        m = self.model
+        if not self.colliders or not m.N or not m.rest_contact.any():
+            return
+        bones = ob.data.bones
+        H = np.array([bones[n].head_local for n in self.sim_names], dtype=np.float64)
+        T = np.array([bones[n].tail_local for n in self.sim_names], dtype=np.float64)
+        pbs = ob.pose.bones
+        A = np.full((len(self.colliders), 3), np.nan)
+        B = A.copy()
+        for j, c in enumerate(self.colliders):
+            if c['i'] < 0:
+                continue
+            Mb = _m4(pbs[c['i']].bone.matrix_local)
+            A[j] = Mb[:3, :3] @ (c['off'] + (0.0, c['t0'] * c['len'], 0.0)) + Mb[:3, 3]
+            B[j] = A[j] if c['shape'] == 'SPHERE' else \
+                Mb[:3, :3] @ (c['off'] + (0.0, c['t1'] * c['len'], 0.0)) + Mb[:3, 3]
+        m.set_rest(T, 0.5 * (H + T), A, B)
+
+    def set_rest_spheres(self, ob, chains, index):
+        """Rest Contact, rest spheres. A chain bone that lies on the body in the rest pose (chain dict 'contacts':
+        per bone None or (body bone name, normal from the body to the bone tail, armature space)) gets a sphere
+        that rides on that body bone and touches the bone's tail in the rest pose from the body's side: centre
+        = rest tail - normal x radius. The tail stays out of it (sim._rest_spheres). The radius is the length of
+        the chain (REST_SPHERE): flat enough to stand for a back or a shoulder under the strand, round enough
+        to let go when the strand hangs somewhere else (a deep bow)."""
+        self.rs_idx = np.zeros(0, dtype=np.int64)
+        rows, anchors, cloc, rad = [], [], [], []
+        bones = ob.data.bones
+        i = 0
+        for c in chains:
+            cc = c.get('contacts')
+            R = REST_SPHERE * sum(bones[n].length for n in c['bones'])
+            for j, n in enumerate(c['bones']):
+                k = cc[j] if cc and j < len(cc) else None
+                if k is not None and k[0] in index and R > 0.0:
+                    nrm = np.array(k[1], dtype=np.float64)
+                    nrm /= max(float(np.linalg.norm(nrm)), 1e-300)
+                    Mi = np.linalg.inv(_m4(bones[k[0]].matrix_local))
+                    ctr = np.array(bones[n].tail_local, dtype=np.float64) - nrm * R
+                    rows.append(i)
+                    anchors.append(index[k[0]])
+                    cloc.append(Mi[:3, :3] @ ctr + Mi[:3, 3])
+                    rad.append(R)
+                i += 1
+        if rows:
+            self.rs_idx = np.array(rows, dtype=np.int64)
+            self.rs_anchor = np.array(anchors, dtype=np.int64)
+            self.rs_cloc = np.array(cloc)
+            self.rs_rad = np.array(rad)
+
+    def rest_spheres(self, pbs, mw):
+        """World centres (N,3) and radii (N,) of the rest spheres on the current pose, or (None, None)."""
+        if not len(self.rs_idx):
+            return None, None
+        N = self.model.N
+        C = np.zeros((N, 3))
+        R = np.zeros(N)
+        for a in np.unique(self.rs_anchor):
+            k = self.rs_anchor == a
+            Mb = mw @ _m4(pbs[int(a)].matrix)
+            C[self.rs_idx[k]] = self.rs_cloc[k] @ Mb[:3, :3].T + Mb[:3, 3]
+            R[self.rs_idx[k]] = self.rs_rad[k] * abs(np.linalg.det(Mb[:3, :3])) ** (1.0 / 3.0)
+        return C, R
 
     # ------------------------------------------------------------------------------------------------ reading
 
@@ -220,7 +291,9 @@ class ArmRT:
             R[j] = c['r'] * abs(np.linalg.det(Mb[:3, :3])) ** (1.0 / 3.0)
         fps = scene.render.fps / scene.render.fps_base
         g = self.gravity_vector / max(scene.unit_settings.scale_length, 1e-9)
-        return sim.Frame(ext, banim, qa, A, B, R, scale=scale, gravity=g, fps=fps, time_scale=self.time_scale)
+        rs_c, rs_r = self.rest_spheres(pbs, mw)
+        return sim.Frame(ext, banim, qa, A, B, R, scale=scale, gravity=g, fps=fps, time_scale=self.time_scale,
+                         rs_c=rs_c, rs_r=rs_r)
 
     @staticmethod
     def collider_object(ob_eval, c):
@@ -349,7 +422,8 @@ class ArmRT:
         dh = collide.distance(self.state.H[roots], fr.col_a, fr.col_b)          # (chains, colliders)
         dt_ = collide.distance(self.state.T[roots], fr.col_a, fr.col_b)
         # head and rest tail both inside: the particle is pushed out of its rest pose at once
-        inside = (dh < rad) & (dt_ < rad + (m.radius[roots] * fr.scale)[:, None]) & m.collide[roots][:, None]
+        inside = (dh < rad) & (dt_ < rad + (m.radius[roots] * fr.scale)[:, None]) & m.collide[roots][:, None] \
+            & ~m.rest_contact[roots][:, None]              # Rest Contact: a bone is never pushed out of its rest pose
         for ci in np.flatnonzero(inside.any(axis=1)):
             name = self.sim_names[int(m.chain_start[ci])]
             msg = "Chain root %s is inside a collider; the bone may stick out of its pose. Move or shrink the collider." % name
@@ -379,6 +453,7 @@ class ArmRT:
         st.ext_R = fr.ext[:, :3, :3].copy()
         st.ext_t = fr.ext[:, :3, 3].copy()
         st.col_a, st.col_b = fr.col_a.copy(), fr.col_b.copy()
+        st.rs_c = None if fr.rs_c is None else fr.rs_c.copy()
         st.q_prev = q.astype(np.float64)
         st.valid = True
         st.contacts = 0
@@ -401,9 +476,11 @@ def flush_animation(ob, ob_eval):
 
 def signature(fr):
     """Hash of the inputs a frame uses (spec 5.5 step 2): armature and external parent matrices, bone bases,
-    collider points and radii, gravity, scale, fps, time scale; rounded to 1e-4."""
+    collider points and radii, rest spheres, gravity, scale, fps, time scale; rounded to 1e-4."""
     x = np.concatenate((fr.ext.ravel(), fr.banim.ravel(), fr.col_a.ravel(), fr.col_b.ravel(), fr.col_r,
                         fr.gravity, (fr.scale, fr.fps, fr.time_scale)))
+    if fr.rs_r is not None:
+        x = np.concatenate((x, fr.rs_c.ravel(), fr.rs_r))
     return hash(np.round(x * 1e4).astype(np.int64).tobytes())
 
 

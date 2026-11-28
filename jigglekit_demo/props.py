@@ -87,6 +87,16 @@ class JigglekitBone(bpy.types.PropertyGroup):
     rest_q: FloatVectorProperty(name="Rest Rotation", size=4, default=(1.0, 0.0, 0.0, 0.0),
                                 description="Authored rotation of the bone when its rotation is not animated",
                                 options={'HIDDEN'}, override=OV)
+    radius: FloatProperty(name="Mesh Radius", subtype='DISTANCE', default=0.0, min=0.0, max=10.0,
+                          options={'HIDDEN'}, override=OV,
+                          description="Collision radius at the bone tail measured from the mesh around the bone "
+                                      "(Create, Weights for Selection). 0 = not measured")
+    contact_bone: StringProperty(name="Contact Bone", options={'HIDDEN'}, override=OV,
+                                 description="Bone ID of the body bone this bone lies on in the rest pose "
+                                             "(Rest Contact). Empty = it does not lie on the body")
+    contact_n: FloatVectorProperty(name="Contact Normal", size=3, default=(0.0, 0.0, 0.0), options={'HIDDEN'},
+                                   override=OV, description="Direction from the body to the bone tail in the rest "
+                                                            "pose, armature space (Rest Contact)")
 
 
 # --------------------------------------------------------------------------------------------------------- chain
@@ -125,6 +135,18 @@ class JigglekitChain(bpy.types.PropertyGroup):
                           override=OV, description="Collision radius at each bone tail. 0 = a point")
     collide: BoolProperty(name="Collide", default=True, update=bump, override=OV,
                           description="Use the armature's colliders")
+    # 1.0.1. Both default to off, so a chain saved with 1.0.0 behaves as it did; Create Jiggle from Selection,
+    # Weights for Selection and Chains from Selected Bones turn them on for the chains they make or touch.
+    mesh_radius: BoolProperty(name="Radius from Mesh", default=False, update=bump, override=OV,
+                              description="Collision radius per bone as measured from the mesh around it (Create "
+                                          "and Weights for Selection measure it), so a thick strand stays out of "
+                                          "the body, not only its bones. Off = Radius for every bone")
+    rest_contact: BoolProperty(name="Rest Contact", default=False, update=bump, override=OV,
+                               description="A bone that lies on the body in the rest pose never goes deeper "
+                                           "into it than it lies at rest, and colliders do not push it off its "
+                                           "rest place. Hair that lies on the back stays on the back and does "
+                                           "not sink into the body. Create and Weights for Selection find the "
+                                           "bones that lie on the body")
     influence: FloatProperty(name="Influence", default=1.0, min=0.0, max=1.0, update=bump, override=OV,
                              description="Mix between the animated pose (0) and the simulated pose (1)")
 

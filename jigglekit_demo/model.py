@@ -8,7 +8,7 @@ from . import ids, runtime
 from .const import DEMO_BONE_LIMIT, EDITION
 
 SIM_KEYS = ('stiffness', 'damping', 'inertia', 'gravity', 'angle_limit', 'tip_ratio', 'tip_damping', 'buckle',
-            'radius', 'collide', 'influence')
+            'radius', 'collide', 'influence', 'rest_contact')
 
 
 # Library overrides (review finding 3, measured 2026-11-23). Blender 4.2 / 4.5 store every JiggleKit property of an
@@ -200,6 +200,24 @@ def _demo_cap(ob, chains, notes, idle):
     return out
 
 
+def contact_of(pb, by_bid, sim_names):
+    """(body bone name, normal) of a chain bone that lies on the body in the rest pose (stored by
+    create_ops.measure_contact), or None: nothing stored, the body bone is gone, or it is simulated itself."""
+    jb = pb.jigglekit
+    n = tuple(jb.contact_n)
+    if not jb.contact_bone or not any(n):
+        return None
+    p = by_bid.get(jb.contact_bone)
+    if p is None:
+        return None
+    name = p.name
+    while p is not None:
+        if p.name in sim_names:
+            return None
+        p = p.parent
+    return name, n
+
+
 def collect(ob, cap=True):
     """Chains (dicts for runtime.ArmRT), colliders, rest quaternions and notes. Reads only. cap=False: without the
     Free edition's bone limit (used to count what other armatures take)."""
@@ -208,6 +226,8 @@ def collect(ob, cap=True):
     params = {ch.id: ch for ch in jk.chains}
     chains, rest, notes, idle = [], [], [], []
     broken = 0
+    by_bid = {pb.jigglekit.bone_id: pb for pb in pbs if pb.jigglekit.bone_id}
+    sim_all = {pb.name for pb in pbs if pb.jigglekit.chain_id}
     for cid, lst in _chain_bones(ob).items():
         ch = params.get(cid)
         lst.sort()
@@ -254,6 +274,14 @@ def collect(ob, cap=True):
             notes.append("Bone %s is in the chain of the IK constraint on %s: IK overrides the jiggle. Jiggle "
                          "bones should not be part of an IK chain." % (n, owner_name))
         d = {k: getattr(ch, k) for k in SIM_KEYS}
+        if ch.mesh_radius:        # radius measured around each bone (Create, Weights for Selection); 0 = not measured
+            rr = [pbs[n].jigglekit.radius for n in names]
+            if max(rr) > 0.0:
+                d['radii'] = [r if r > 0.0 else ch.radius for r in rr]
+        if ch.rest_contact and ch.collide:      # rest spheres: bones that lie on the body in the rest pose
+            cc = [contact_of(pbs[n], by_bid, sim_all) for n in names]
+            if any(cc):
+                d['contacts'] = cc
         d['bones'] = names
         d['chain_id'] = cid
         chains.append(d)
@@ -262,7 +290,6 @@ def collect(ob, cap=True):
     rest = [tuple(pbs[n].jigglekit.rest_q) for c in chains for n in c['bones']]
     sim_names = {n for c in chains for n in c['bones']}
     colliders = []
-    by_bid = {pb.jigglekit.bone_id: pb for pb in pbs if pb.jigglekit.bone_id}
     for ci, col in enumerate(jk.colliders):
         if not col.enabled:
             continue
